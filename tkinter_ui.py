@@ -1,0 +1,331 @@
+import tkinter as tk
+from tkinter import filedialog, messagebox
+from ultralytics import solution
+from PIL import Image, ImageTk
+import numpy as np
+import cv2
+import os
+import json
+
+PANELS = ["north", "east", "west", "south"]
+ROI_FILE = "roi.json"
+
+
+class VideoPanel:
+    def __init__(self, parent, name):
+        self.name = name
+
+        # ----- STATE -----
+        self.cap = None
+        self.imgtk = None
+        self.last_frame = None  # last BGR frame (OpenCV)
+
+        # ROI state (normalized points)
+        self.editing_roi = False
+        self.roi_points_norm = []
+        self.roi_closed = False
+
+        # This frame will be managed by GRID (by the parent)
+        self.frame = tk.LabelFrame(parent, text=name.upper(), padx=5, pady=5)
+
+        # Canvas (create FIRST)
+        self.canvas = tk.Canvas(self.frame, bg="black")
+        self.canvas.pack(expand=True, fill=tk.BOTH)
+
+        # Bind events AFTER canvas exists
+        self.canvas.bind("<Button-1>", self.on_canvas_click)
+        self.canvas.bind("<Double-Button-1>", self.on_canvas_double_click)
+        self.canvas.bind("<Configure>", self.on_canvas_resize)  # redraw ROI on resize
+
+        # Buttons
+        self.btn_frame = tk.Frame(self.frame)
+        self.btn_frame.pack(fill=tk.X)
+
+        self.load_btn = tk.Button(self.btn_frame, text="Load Video", command=self.load_video)
+        self.load_btn.pack(side=tk.LEFT, expand=True, fill=tk.X)
+
+        self.edit_btn = tk.Button(self.btn_frame, text="Edit Area", command=self.edit_roi)
+        self.edit_btn.pack(side=tk.LEFT, expand=True, fill=tk.X)
+
+        self.save_btn = tk.Button(self.btn_frame, text="Save Area", command=self.save_roi_temp)
+        self.save_btn.pack(side=tk.LEFT, expand=True, fill=tk.X)
+
+        # Load ROI from disk (if exists)
+        self.load_roi_temp()
+        self.redraw_overlay()
+
+    # ---------- Video ----------
+    def load_video(self, path=None):
+        if not path:
+            path = filedialog.askopenfilename(
+                filetypes=[("Video Files", "*.mp4 *.avi *.mkv")]
+            )
+        if not path:
+            return
+
+        if self.cap:
+            self.cap.release()
+
+        self.cap = cv2.VideoCapture(path)
+        if not self.cap.isOpened():
+            messagebox.showerror("Error", f"Cannot open video: {path}")
+            self.cap = None
+            return
+
+        self.update_frame()
+
+    def update_frame(self):
+        if not self.cap:
+            return
+
+        ret, frame = self.cap.read()
+        if not ret:
+            # loop video
+            self.cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
+            return
+
+        self.last_frame = frame
+        self.show_frame(frame)
+
+        # schedule next frame
+        self.frame.after(30, self.update_frame)
+
+    def show_frame(self, frame_bgr):
+        canvas_w = self.canvas.winfo_width()
+        canvas_h = self.canvas.winfo_height()
+        if canvas_w < 10 or canvas_h < 10:
+            return
+
+        frame_rgb = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB)
+        img = Image.fromarray(frame_rgb).resize((canvas_w, canvas_h), Image.BILINEAR)
+
+        self.imgtk = ImageTk.PhotoImage(img)
+
+        # Draw background image only (tag it), don't delete ROI
+        self.canvas.delete("bg")
+        self.canvas.create_image(0, 0, anchor=tk.NW, image=self.imgtk, tags="bg")
+        self.canvas.tag_lower("bg")
+
+        # Redraw ROI on top
+        self.redraw_overlay()
+
+    def on_canvas_resize(self, event):
+        # If video already loaded, redraw the current frame at new size
+        if self.last_frame is not None:
+            self.show_frame(self.last_frame)
+        else:
+            self.redraw_overlay()
+
+    # ---------- ROI Editing ----------
+    def edit_roi(self):
+        self.editing_roi = not self.editing_roi
+        if self.editing_roi:
+            # start new ROI
+            self.roi_points_norm = []
+            self.roi_closed = False
+            self.edit_btn.config(relief=tk.SUNKEN)
+            print(f"[{self.name}] ROI editing started")
+        else:
+            self.edit_btn.config(relief=tk.RAISED)
+            print(f"[{self.name}] ROI editing stopped")
+        self.redraw_overlay()
+
+    def on_canvas_click(self, event):
+        if not self.editing_roi or self.roi_closed:
+            return
+
+        cw = self.canvas.winfo_width()
+        ch = self.canvas.winfo_height()
+        if cw <= 1 or ch <= 1:
+            return
+
+        x_norm = event.x / cw
+        y_norm = event.y / ch
+
+        # clamp 0..1
+        x_norm = max(0.0, min(1.0, x_norm))
+        y_norm = max(0.0, min(1.0, y_norm))
+
+        self.roi_points_norm.append({"x": x_norm, "y": y_norm})
+        self.redraw_overlay()
+
+    def on_canvas_double_click(self, event):
+        if not self.editing_roi:
+            return
+
+        if len(self.roi_points_norm) >= 3:
+            self.roi_closed = True
+            self.editing_roi = False
+            self.edit_btn.config(relief=tk.RAISED)
+            self.save_roi_temp()
+            self.redraw_overlay()
+            print(f"[{self.name}] ROI closed & saved")
+
+    def redraw_overlay(self):
+        # Only delete ROI drawings, keep bg image
+        self.canvas.delete("roi")
+
+        if not self.roi_points_norm:
+            return
+
+        w = self.canvas.winfo_width()
+        h = self.canvas.winfo_height()
+        if w <= 1 or h <= 1:
+            return
+
+        pts = [(p["x"] * w, p["y"] * h) for p in self.roi_points_norm]
+
+        # points
+        for x, y in pts:
+            self.canvas.create_oval(
+                x - 4, y - 4, x + 4, y + 4,
+                fill="lime", outline="", tags="roi"
+            )
+
+        # polyline
+        if len(pts) >= 2:
+            flat = []
+            for x, y in pts:
+                flat.extend([x, y])
+            self.canvas.create_line(*flat, fill="lime", width=2, tags="roi")
+
+        # close polygon
+        if self.roi_closed and len(pts) >= 3:
+            self.canvas.create_line(
+                pts[-1][0], pts[-1][1],
+                pts[0][0], pts[0][1],
+                fill="lime", width=2, tags="roi"
+            )
+
+        # hint text
+        if self.editing_roi:
+            self.canvas.create_text(
+                10, 10, anchor="nw",
+                text="ROI edit: click points, double-click to close",
+                fill="white", tags="roi"
+            )
+
+    # ---------- ROI Persistence (JSON) ----------
+    def save_roi_temp(self):
+        data = {}
+        if os.path.exists(ROI_FILE):
+            try:
+                with open(ROI_FILE, "r", encoding="utf-8") as f:
+                    data = json.load(f)
+            except Exception:
+                data = {}
+
+        data[self.name] = {
+            "points": self.roi_points_norm,
+            "closed": self.roi_closed
+        }
+
+        with open(ROI_FILE, "w", encoding="utf-8") as f:
+            json.dump(data, f, indent=2)
+
+        print(f"[{self.name}] ROI saved to {ROI_FILE}")
+
+    def load_roi_temp(self):
+        if not os.path.exists(ROI_FILE):
+            return
+
+        try:
+            with open(ROI_FILE, "r", encoding="utf-8") as f:
+                data = json.load(f)
+        except Exception:
+            return
+
+        if self.name in data:
+            item = data[self.name]
+            self.roi_points_norm = item.get("points", []) or []
+            self.roi_closed = bool(item.get("closed", False))
+            print(f"[{self.name}] ROI loaded from {ROI_FILE}")
+
+    # ---------- OpenCV bridge ----------
+    def get_roi_polygon_px(self, frame_bgr):
+        """
+        Returns Nx2 int32 polygon points in pixel space (OpenCV-friendly),
+        or None if ROI not valid.
+        """
+        if not self.roi_closed or len(self.roi_points_norm) < 3:
+            return None
+
+        h, w = frame_bgr.shape[:2]
+        pts = np.array(
+            [[int(p["x"] * w), int(p["y"] * h)] for p in self.roi_points_norm],
+            dtype=np.int32
+        )
+        return pts
+
+    def get_roi_mask(self, frame_bgr):
+        """
+        Returns a uint8 mask (same w,h) with ROI filled, or None.
+        """
+        pts = self.get_roi_polygon_px(frame_bgr)
+        if pts is None:
+            return None
+        h, w = frame_bgr.shape[:2]
+        mask = np.zeros((h, w), dtype=np.uint8)
+        cv2.fillPoly(mask, [pts], 255)
+        return mask
+
+
+class TrafficApp:
+    def __init__(self, root):
+        self.root = root
+        root.title("Smart Traffic Control System")
+        root.geometry("1200x800")
+
+        # Top toolbar
+        toolbar = tk.Frame(root)
+        toolbar.pack(fill=tk.X)
+
+        tk.Button(toolbar, text="Load Videos (Auto Assign)", command=self.load_videos_auto).pack(
+            side=tk.LEFT, padx=5, pady=5
+        )
+
+        tk.Button(toolbar, text="Reload ROI", command=self.reload_all_roi).pack(
+            side=tk.LEFT, padx=5, pady=5
+        )
+
+        # Grid container
+        grid = tk.Frame(root)
+        grid.pack(expand=True, fill=tk.BOTH)
+
+        grid.rowconfigure((0, 1), weight=1)
+        grid.columnconfigure((0, 1), weight=1)
+
+        self.panels = {}
+
+        positions = {
+            "north": (0, 0),
+            "east":  (0, 1),
+            "west":  (1, 0),
+            "south": (1, 1)
+        }
+
+        for name, (r, c) in positions.items():
+            panel = VideoPanel(grid, name)
+            panel.frame.grid(row=r, column=c, sticky="nsew")
+            self.panels[name] = panel
+
+    def reload_all_roi(self):
+        for p in self.panels.values():
+            p.load_roi_temp()
+            p.redraw_overlay()
+
+    def load_videos_auto(self):
+        files = filedialog.askopenfilenames(
+            filetypes=[("Video Files", "*.mp4 *.avi *.mkv")]
+        )
+        for path in files:
+            base = os.path.basename(path).lower()
+            for panel_name in PANELS:
+                if panel_name in base:
+                    self.panels[panel_name].load_video(path)
+
+
+if __name__ == "__main__":
+    root = tk.Tk()
+    app = TrafficApp(root)
+    root.mainloop()
