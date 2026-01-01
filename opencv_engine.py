@@ -54,3 +54,47 @@ class TrafficProcessor:
         )
 
         return processed_frame, vehicle_count, green_time, fuzzy_in, fuzzy_out
+    def draw_traffic_overlay(frame, vehicle_count, green_time, fuzzy_in, fuzzy_out):
+        """
+        Draw traffic info directly on the frame (OpenCV overlay).
+        """
+        y = 25
+        line_h = 22
+
+        def text(msg, color=(255, 255, 255)):
+            nonlocal y
+            cv2.putText(
+                frame, msg,
+                (10, y),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.6,
+                color,
+                2,
+                cv2.LINE_AA
+            )
+            y += line_h
+
+        # Background box (for readability)
+        overlay = frame.copy()
+        cv2.rectangle(overlay, (5, 5), (420, 160), (0, 0, 0), -1)
+        cv2.addWeighted(overlay, 0.5, frame, 0.5, 0, frame)
+
+        text("SMART TRAFFIC LIGHT", (0, 255, 255))
+        text(f"Vehicles: {vehicle_count}", (0, 255, 255))
+        text(f"Green Time: {green_time:.1f} s", (0, 255, 0))
+
+        if fuzzy_in:
+            text(
+                f"Fuzzy In  L:{fuzzy_in['low']:.2f} "
+                f"M:{fuzzy_in['medium']:.2f} "
+                f"H:{fuzzy_in['high']:.2f}"
+            )
+
+        if fuzzy_out:
+            text(
+                f"Fuzzy Out S:{fuzzy_out['short']:.2f} "
+                f"M:{fuzzy_out['medium']:.2f} "
+                f"L:{fuzzy_out['long']:.2f}"
+            )
+
+        return frame

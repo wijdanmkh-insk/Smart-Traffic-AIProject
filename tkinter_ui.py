@@ -8,6 +8,7 @@ from ultralytics import solutions
 import cv2
 import os
 import json
+import time
 
 PANELS = ["north", "east", "west", "south"]
 ROI_FILE = "roi.json"
@@ -16,6 +17,7 @@ ROI_FILE = "roi.json"
 class VideoPanel:
     def __init__(self, parent, name):
         self.name = name
+
         #------ START PROCESSING --------
         self.processor = TrafficProcessor("python/dataset/yolo11n.pt")
         self.processing = False
@@ -76,18 +78,19 @@ class VideoPanel:
     #------ PROCESSING LOOP --------
     def _processing_loop(self):
         while self.processing:
-            ret, frame = self.cap.read()
-            if not ret:
-                self.cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
+            if self.latest_frame is None:
+                # wait until UI thread provides a frame
+                time.sleep(0.01)
                 continue
 
+            frame = self.latest_frame.copy()  # copy safe frame
+
+            # apply ROI only if exists
             roi_px = self.get_roi_polygon_px(frame)
             if roi_px is not None:
                 self.processor.set_roi(roi_px.tolist())
 
-            processed, count, green, fin, fout = (
-                self.processor.process_frame(frame)
-            )
+            processed, count, green, fin, fout = self.processor.process_frame(frame)
 
             self.processed_frame = processed
             self.stats = {
@@ -96,6 +99,7 @@ class VideoPanel:
                 "fuzzy_in": fin,
                 "fuzzy_out": fout
             }
+
 
     # ---------- Video ----------
     def load_video(self, path=None):
@@ -144,6 +148,11 @@ class VideoPanel:
         self.show_frame(frame)
         self.frame.after(30, self.update_frame)
 
+        if not self.processing:
+            self.processing = True
+            threading.Thread(target=self.processing_loop, daemon=True).start()
+
+
 
     def update_frame(self):
         if not self.cap:
@@ -152,17 +161,22 @@ class VideoPanel:
         ret, frame = self.cap.read()
 
         if not ret:
-            # loop video instead of stopping forever
+            # restart from beginning
             self.cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
             self.frame.after(30, self.update_frame)
             return
 
         self.last_frame = frame
-        self.show_frame(frame)
+        self.latest_frame = frame  # feed worker with new frame
 
-        # KEEP THE LOOP ALIVE
+        if self.processed_frame is not None:
+            # show processed frame from worker
+            self.show_frame(self.processed_frame)
+        else:
+            # show raw frame if processing not ready
+            self.show_frame(frame)
+
         self.frame.after(30, self.update_frame)
-
 
 
     def show_frame(self, frame_bgr):
@@ -173,15 +187,11 @@ class VideoPanel:
 
         frame_rgb = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB)
         img = Image.fromarray(frame_rgb).resize((canvas_w, canvas_h), Image.BILINEAR)
-
         self.imgtk = ImageTk.PhotoImage(img)
 
-        # Draw background image only (tag it), don't delete ROI
         self.canvas.delete("bg")
         self.canvas.create_image(0, 0, anchor=tk.NW, image=self.imgtk, tags="bg")
-        self.canvas.tag_lower("bg")
 
-        # Redraw ROI on top
         self.redraw_overlay()
 
     def on_canvas_resize(self, event):
@@ -297,6 +307,10 @@ class VideoPanel:
             json.dump(data, f, indent=2)
 
         print(f"[{self.name}] ROI saved to {ROI_FILE}")
+        messagebox.showinfo(
+                "Area Saved",
+                f"Counted Area on the '{self.name.upper()}' has been saved successfully!"
+        )
 
     def load_roi_temp(self):
         if not os.path.exists(ROI_FILE):
@@ -342,31 +356,73 @@ class VideoPanel:
         cv2.fillPoly(mask, [pts], 255)
         return mask
 
+    def draw_traffic_overlay(self):
+        s = self.stats
+        y = 10
+
+        def line(text, color="white"):
+            nonlocal y
+            self.canvas.create_text(
+                10, y,
+                anchor="nw",
+                text=text,
+                fill=color,
+                font=("Segoe UI", 10, "bold"),
+                tags="overlay"
+            )
+            y += 18
+
+        self.canvas.delete("overlay")
+
+        line("SMART TRAFFIC LIGHT", "cyan")
+        line(f"Vehicles: {s.get('vehicles', 0)}", "yellow")
+        line(f"Green Time: {s.get('green_time', 0)} s", "lime")
+
+        fin = s.get("fuzzy_in", {})
+        fout = s.get("fuzzy_out", {})
+
+        if fin:
+            line(f"Fuzzy In  L:{fin['low']:.2f} M:{fin['medium']:.2f} H:{fin['high']:.2f}")
+
+        if fout:
+            line(f"Fuzzy Out S:{fout['short']:.2f} M:{fout['medium']:.2f} L:{fout['long']:.2f}")
 
 class TrafficApp:
     def __init__(self, root):
         self.root = root
         root.title("Smart Traffic Control System")
-        root.geometry("1200x800")
+        root.geometry("1400x800")
 
-        # Top toolbar
+        # ================= TOP TOOLBAR =================
         toolbar = tk.Frame(root)
         toolbar.pack(fill=tk.X)
 
-        tk.Button(toolbar, text="Load Videos (Auto Assign)", command=self.load_videos_auto).pack(
-            side=tk.LEFT, padx=5, pady=5
-        )
+        tk.Button(
+            toolbar,
+            text="Load Videos (Auto Assign)",
+            command=self.load_videos_auto
+        ).pack(side=tk.LEFT, padx=5, pady=5)
 
-        tk.Button(toolbar, text="Reload ROI", command=self.reload_all_roi).pack(
-            side=tk.LEFT, padx=5, pady=5
-        )
+        tk.Button(
+            toolbar,
+            text="Reload ROI",
+            command=self.reload_all_roi
+        ).pack(side=tk.LEFT, padx=5, pady=5)
 
-        # Grid container
-        grid = tk.Frame(root)
-        grid.pack(expand=True, fill=tk.BOTH)
+        # ================= MAIN LAYOUT =================
+        main = tk.Frame(root)
+        main.pack(expand=True, fill=tk.BOTH)
 
-        grid.rowconfigure((0, 1), weight=1)
-        grid.columnconfigure((0, 1), weight=1)
+        main.columnconfigure(0, weight=4)  # video area
+        main.columnconfigure(1, weight=1)  # info panel
+        main.rowconfigure(0, weight=1)
+
+        # ================= LEFT: VIDEO GRID =================
+        video_grid = tk.Frame(main)
+        video_grid.grid(row=0, column=0, sticky="nsew", padx=5, pady=5)
+
+        video_grid.rowconfigure((0, 1), weight=1)
+        video_grid.columnconfigure((0, 1), weight=1)
 
         self.panels = {}
 
@@ -378,10 +434,68 @@ class TrafficApp:
         }
 
         for name, (r, c) in positions.items():
-            panel = VideoPanel(grid, name)
-            panel.frame.grid(row=r, column=c, sticky="nsew")
+            panel = VideoPanel(video_grid, name)
+            panel.frame.grid(row=r, column=c, sticky="nsew", padx=4, pady=4)
             self.panels[name] = panel
 
+        # ================= RIGHT: INFO PANEL =================
+        self.info_panel = tk.LabelFrame(
+            main,
+            text="Traffic Information",
+            padx=10,
+            pady=10
+        )
+        self.info_panel.grid(row=0, column=1, sticky="nsew", padx=5, pady=5)
+
+        self.info_labels = {}
+
+        for name in ["north", "east", "west", "south"]:
+            lbl = tk.Label(
+                self.info_panel,
+                text=self._default_info_text(name),
+                justify="left",
+                anchor="w",
+                font=("Segoe UI", 10),
+                padx=6,
+                pady=6,
+                relief=tk.GROOVE
+            )
+            lbl.pack(fill="x", pady=5)
+            self.info_labels[name] = lbl
+
+        # start periodic update
+        self.update_info_panel()
+
+    # ================= INFO PANEL =================
+    def _default_info_text(self, name):
+        return (
+            f"{name.upper()}\n"
+            f"Vehicles: 0\n"
+            f"Green Light: 0 s"
+        )
+
+    def update_info_panel(self):
+        for name, panel in self.panels.items():
+            stats = getattr(panel, "stats", None)
+
+            if not stats:
+                self.info_labels[name].config(
+                    text=self._default_info_text(name)
+                )
+                continue
+
+            text = (
+                f"{name.upper()}\n"
+                f"Vehicles: {stats.get('count', 0)}\n"
+                f"Green Light: {stats.get('green', 0)} s"
+            )
+
+            self.info_labels[name].config(text=text)
+
+        # update every 500 ms
+        self.root.after(500, self.update_info_panel)
+
+    # ================= ACTIONS =================
     def reload_all_roi(self):
         for p in self.panels.values():
             p.load_roi_temp()
@@ -391,6 +505,7 @@ class TrafficApp:
         files = filedialog.askopenfilenames(
             filetypes=[("Video Files", "*.mp4 *.avi *.mkv")]
         )
+
         for path in files:
             base = os.path.basename(path).lower()
             for panel_name in PANELS:

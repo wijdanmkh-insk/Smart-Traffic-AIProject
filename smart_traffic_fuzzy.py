@@ -98,7 +98,7 @@ def draw_traffic_info(frame, vehicle_count, green_time, fuzzy_in, fuzzy_out):
     
     # Title
     cv2.putText(panel, "SMART TRAFFIC LIGHT - FUZZY LOGIC", (10, 25),
-                cv2.FONT_HERSHEY_BOLD, 0.7, (255, 255, 255), 2)
+                cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2)
     
     # Vehicle count
     cv2.putText(panel, f"Vehicles Detected: {vehicle_count}", (10, 60),
@@ -207,4 +207,4 @@ def count_objects_in_region(video_path, output_video_path, model_path):
     print("="*60)
 
 # Run the program
-count_objects_in_region("sample/src/cars.mp4", "sample/output/output_video.avi", "python/dataset/yolo11n.pt")
+count_objects_in_region("north.mp4", "/output_video.avi", "python/dataset/yolo11n.pt")
