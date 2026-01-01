@@ -4,5 +4,6 @@ __pycache__/
 *.pyo
 roi.json
 *.log
+*.json
 .DS_Store
 Thumbs.db

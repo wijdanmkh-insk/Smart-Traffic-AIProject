@@ -1,8 +1,10 @@
 import tkinter as tk
 from tkinter import filedialog, messagebox
-from ultralytics import solution
 from PIL import Image, ImageTk
 import numpy as np
+import threading
+from opencv_engine import TrafficProcessor
+from ultralytics import solutions
 import cv2
 import os
 import json
@@ -14,6 +16,12 @@ ROI_FILE = "roi.json"
 class VideoPanel:
     def __init__(self, parent, name):
         self.name = name
+        #------ START PROCESSING --------
+        self.processor = TrafficProcessor("python/dataset/yolo11n.pt")
+        self.processing = False
+        self.worker_thread = None
+        self.processed_frame = None
+        self.stats = {}
 
         # ----- STATE -----
         self.cap = None
@@ -54,6 +62,41 @@ class VideoPanel:
         self.load_roi_temp()
         self.redraw_overlay()
 
+    # ---------- Video Processing ----------
+    def start_processing(self):
+        if self.processing or not self.cap:
+            return
+
+        self.processing = True
+        self.worker_thread = threading.Thread(
+            target=self._processing_loop,
+            daemon=True
+        )
+        self.worker_thread.start()
+    #------ PROCESSING LOOP --------
+    def _processing_loop(self):
+        while self.processing:
+            ret, frame = self.cap.read()
+            if not ret:
+                self.cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
+                continue
+
+            roi_px = self.get_roi_polygon_px(frame)
+            if roi_px is not None:
+                self.processor.set_roi(roi_px.tolist())
+
+            processed, count, green, fin, fout = (
+                self.processor.process_frame(frame)
+            )
+
+            self.processed_frame = processed
+            self.stats = {
+                "count": count,
+                "green": green,
+                "fuzzy_in": fin,
+                "fuzzy_out": fout
+            }
+
     # ---------- Video ----------
     def load_video(self, path=None):
         if not path:
@@ -63,32 +106,64 @@ class VideoPanel:
         if not path:
             return
 
+        # release old capture
         if self.cap:
             self.cap.release()
-
-        self.cap = cv2.VideoCapture(path)
-        if not self.cap.isOpened():
-            messagebox.showerror("Error", f"Cannot open video: {path}")
             self.cap = None
+
+        cap = cv2.VideoCapture(path)
+
+        # Fail early
+        if not cap.isOpened():
+            messagebox.showerror("Load Video Failed", f"Cannot open video:\n{path}")
             return
 
-        self.update_frame()
+        # Try reading first frame to confirm it's actually readable
+        ok, frame = cap.read()
+        if not ok or frame is None:
+            cap.release()
+            messagebox.showerror("Load Video Failed", f"Video opened but cannot read frames:\n{path}")
+            return
+
+        # If OK, keep it
+        self.cap = cap
+        self.last_frame = frame
+
+        # Show info
+        fps = self.cap.get(cv2.CAP_PROP_FPS)
+        h, w = frame.shape[:2]
+        messagebox.showinfo(
+            "Video Loaded",
+            f"[{self.name.upper()}] Loaded successfully!\n\n"
+            f"File: {os.path.basename(path)}\n"
+            f"Resolution: {w} x {h}\n"
+            f"FPS: {fps:.2f}"
+        )
+
+        # Display first frame immediately, then continue playing
+        self.show_frame(frame)
+        self.frame.after(30, self.update_frame)
+
 
     def update_frame(self):
         if not self.cap:
             return
 
         ret, frame = self.cap.read()
+
         if not ret:
-            # loop video
+            # loop video instead of stopping forever
             self.cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
+            self.frame.after(30, self.update_frame)
             return
 
         self.last_frame = frame
         self.show_frame(frame)
 
-        # schedule next frame
+        # KEEP THE LOOP ALIVE
         self.frame.after(30, self.update_frame)
+
+
 
     def show_frame(self, frame_bgr):
         canvas_w = self.canvas.winfo_width()
@@ -110,11 +185,9 @@ class VideoPanel:
         self.redraw_overlay()
 
     def on_canvas_resize(self, event):
-        # If video already loaded, redraw the current frame at new size
         if self.last_frame is not None:
             self.show_frame(self.last_frame)
-        else:
-            self.redraw_overlay()
+
 
     # ---------- ROI Editing ----------
     def edit_roi(self):
