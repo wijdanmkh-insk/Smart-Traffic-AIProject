@@ -7,5 +7,9 @@ roi.json
 *.json
 .DS_Store
 Thumbs.db
+
 *.mp4
+
+sample/
 python/
+data/

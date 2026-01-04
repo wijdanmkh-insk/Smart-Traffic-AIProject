@@ -1,51 +1,59 @@
 import tkinter as tk
-from tkinter import filedialog, messagebox
+from tkinter import filedialog, messagebox, ttk
 from PIL import Image, ImageTk
 import numpy as np
 import threading
 from opencv_engine import TrafficProcessor
-from ultralytics import solutions
+from db import TrafficDatabase
+from traffic_controller import TrafficLightController
 import cv2
 import os
 import json
 import time
+import math
 
 PANELS = ["north", "east", "west", "south"]
 ROI_FILE = "roi.json"
 
 
 class VideoPanel:
-    def __init__(self, parent, name):
+    def __init__(self, parent, name, light_controller, database):
         self.name = name
+        self.light_controller = light_controller
+        self.database = database
 
-        #------ START PROCESSING --------
+        # ------ PROCESSING --------
         self.processor = TrafficProcessor("python/dataset/yolo11n.pt")
         self.processing = False
         self.worker_thread = None
         self.processed_frame = None
+        self.latest_frame = None
         self.stats = {}
+
+        # Logging timer (every 5 seconds)
+        self.last_log_time = time.time()
+        self.log_interval = 5  # seconds
 
         # ----- STATE -----
         self.cap = None
         self.imgtk = None
-        self.last_frame = None  # last BGR frame (OpenCV)
+        self.last_frame = None
 
-        # ROI state (normalized points)
+        # ROI state
         self.editing_roi = False
         self.roi_points_norm = []
         self.roi_closed = False
 
-        # This frame will be managed by GRID (by the parent)
+        # Frame
         self.frame = tk.LabelFrame(parent, text=name.upper(), padx=5, pady=5)
 
-        # Canvas (create FIRST)
+        # Canvas
         self.canvas = tk.Canvas(self.frame, bg="black")
         self.canvas.pack(expand=True, fill=tk.BOTH)
 
-        # Bind events AFTER canvas exists
         self.canvas.bind("<Button-1>", self.on_canvas_click)
         self.canvas.bind("<Double-Button-1>", self.on_canvas_double_click)
-        self.canvas.bind("<Configure>", self.on_canvas_resize)  # redraw ROI on resize
+        self.canvas.bind("<Configure>", self.on_canvas_resize)
 
         # Buttons
         self.btn_frame = tk.Frame(self.frame)
@@ -60,48 +68,118 @@ class VideoPanel:
         self.save_btn = tk.Button(self.btn_frame, text="Save Area", command=self.save_roi_temp)
         self.save_btn.pack(side=tk.LEFT, expand=True, fill=tk.X)
 
-        # Load ROI from disk (if exists)
+        # Traffic light indicator
+        self.light_frame = tk.Frame(self.frame, height=40, bg="black")
+        self.light_frame.pack(fill=tk.X)
+        self.light_frame.pack_propagate(False)
+
+        self.light_canvas = tk.Canvas(self.light_frame, bg="black", height=40, highlightthickness=0)
+        self.light_canvas.pack(fill=tk.BOTH, expand=True)
+
+        # Load ROI
         self.load_roi_temp()
         self.redraw_overlay()
 
-    # ---------- Video Processing ----------
+        # Start light update
+        self.update_light_display()
+
+    def update_light_display(self):
+        """Update traffic light visual indicator"""
+        state = self.light_controller.get_state(self.name)
+        light = state["light"]
+        timer = state["timer"]
+
+        # Clear canvas
+        self.light_canvas.delete("all")
+
+        # Draw traffic light
+        x_start = 10
+        circle_r = 15
+
+        # RED light
+        red_color = "#FF0000" if light == "RED" else "#440000"
+        self.light_canvas.create_oval(
+            x_start, 10, x_start + circle_r * 2, 10 + circle_r * 2,
+            fill=red_color, outline="white", width=2
+        )
+
+        # YELLOW light
+        yellow_color = "#FFFF00" if light == "YELLOW" else "#444400"
+        self.light_canvas.create_oval(
+            x_start + 40, 10, x_start + 40 + circle_r * 2, 10 + circle_r * 2,
+            fill=yellow_color, outline="white", width=2
+        )
+
+        # GREEN light
+        green_color = "#00FF00" if light == "GREEN" else "#004400"
+        self.light_canvas.create_oval(
+            x_start + 80, 10, x_start + 80 + circle_r * 2, 10 + circle_r * 2,
+            fill=green_color, outline="white", width=2
+        )
+
+        # Timer text
+        if light in ["GREEN", "YELLOW"]:
+            self.light_canvas.create_text(
+                x_start + 120, 20,
+                text=f"Timer: {math.ceil(timer)}s",
+                fill="white",
+                font=("Segoe UI", 12, "bold"),
+                anchor="w"
+            )
+
+        # Schedule next update
+        self.frame.after(500, self.update_light_display)
+
     def start_processing(self):
         if self.processing or not self.cap:
             return
 
         self.processing = True
-        self.worker_thread = threading.Thread(
-            target=self._processing_loop,
-            daemon=True
-        )
+        self.worker_thread = threading.Thread(target=self._processing_loop, daemon=True)
         self.worker_thread.start()
-    #------ PROCESSING LOOP --------
+        print(f"[{self.name}] Processing thread started")
+
     def _processing_loop(self):
         while self.processing:
             if self.latest_frame is None:
-                # wait until UI thread provides a frame
                 time.sleep(0.01)
                 continue
 
-            frame = self.latest_frame.copy()  # copy safe frame
+            frame = self.latest_frame.copy()
 
-            # apply ROI only if exists
             roi_px = self.get_roi_polygon_px(frame)
             if roi_px is not None:
                 self.processor.set_roi(roi_px.tolist())
+            else:
+                self.processor.set_roi(None)
 
-            processed, count, green, fin, fout = self.processor.process_frame(frame)
+            try:
+                processed, count, green, fuzzy_in, fuzzy_out = self.processor.process_frame(frame)
 
-            self.processed_frame = processed
-            self.stats = {
-                "count": count,
-                "green": green,
-                "fuzzy_in": fin,
-                "fuzzy_out": fout
-            }
+                self.processed_frame = processed
+                self.stats = {
+                    "count": count,
+                    "green": green,
+                    "fuzzy_in": fuzzy_in,
+                    "fuzzy_out": fuzzy_out
+                }
 
+                # Update green duration in light controller
+                self.light_controller.update_green_duration(self.name, green)
 
-    # ---------- Video ----------
+                # Log to database every 5 seconds
+                current_time = time.time()
+                if current_time - self.last_log_time >= self.log_interval:
+                    light_state = self.light_controller.get_state(self.name)["light"]
+                    self.database.log_traffic(
+                        self.name, count, green, light_state, fuzzy_in
+                    )
+                    self.last_log_time = current_time
+
+            except Exception as e:
+                print(f"[{self.name}] Processing error: {e}")
+                time.sleep(0.1)
+
     def load_video(self, path=None):
         if not path:
             path = filedialog.askopenfilename(
@@ -110,30 +188,26 @@ class VideoPanel:
         if not path:
             return
 
-        # release old capture
         if self.cap:
             self.cap.release()
             self.cap = None
 
         cap = cv2.VideoCapture(path)
 
-        # Fail early
         if not cap.isOpened():
             messagebox.showerror("Load Video Failed", f"Cannot open video:\n{path}")
             return
 
-        # Try reading first frame to confirm it's actually readable
         ok, frame = cap.read()
         if not ok or frame is None:
             cap.release()
             messagebox.showerror("Load Video Failed", f"Video opened but cannot read frames:\n{path}")
             return
 
-        # If OK, keep it
         self.cap = cap
         self.last_frame = frame
+        self.latest_frame = frame
 
-        # Show info
         fps = self.cap.get(cv2.CAP_PROP_FPS)
         h, w = frame.shape[:2]
         messagebox.showinfo(
@@ -144,15 +218,11 @@ class VideoPanel:
             f"FPS: {fps:.2f}"
         )
 
-        # Display first frame immediately, then continue playing
         self.show_frame(frame)
         self.frame.after(30, self.update_frame)
 
         if not self.processing:
-            self.processing = True
-            threading.Thread(target=self.processing_loop, daemon=True).start()
-
-
+            self.start_processing()
 
     def update_frame(self):
         if not self.cap:
@@ -161,23 +231,19 @@ class VideoPanel:
         ret, frame = self.cap.read()
 
         if not ret:
-            # restart from beginning
             self.cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
             self.frame.after(30, self.update_frame)
             return
 
         self.last_frame = frame
-        self.latest_frame = frame  # feed worker with new frame
+        self.latest_frame = frame
 
         if self.processed_frame is not None:
-            # show processed frame from worker
             self.show_frame(self.processed_frame)
         else:
-            # show raw frame if processing not ready
             self.show_frame(frame)
 
         self.frame.after(30, self.update_frame)
-
 
     def show_frame(self, frame_bgr):
         canvas_w = self.canvas.winfo_width()
@@ -198,12 +264,9 @@ class VideoPanel:
         if self.last_frame is not None:
             self.show_frame(self.last_frame)
 
-
-    # ---------- ROI Editing ----------
     def edit_roi(self):
         self.editing_roi = not self.editing_roi
         if self.editing_roi:
-            # start new ROI
             self.roi_points_norm = []
             self.roi_closed = False
             self.edit_btn.config(relief=tk.SUNKEN)
@@ -225,7 +288,6 @@ class VideoPanel:
         x_norm = event.x / cw
         y_norm = event.y / ch
 
-        # clamp 0..1
         x_norm = max(0.0, min(1.0, x_norm))
         y_norm = max(0.0, min(1.0, y_norm))
 
@@ -245,7 +307,6 @@ class VideoPanel:
             print(f"[{self.name}] ROI closed & saved")
 
     def redraw_overlay(self):
-        # Only delete ROI drawings, keep bg image
         self.canvas.delete("roi")
 
         if not self.roi_points_norm:
@@ -258,21 +319,18 @@ class VideoPanel:
 
         pts = [(p["x"] * w, p["y"] * h) for p in self.roi_points_norm]
 
-        # points
         for x, y in pts:
             self.canvas.create_oval(
                 x - 4, y - 4, x + 4, y + 4,
                 fill="lime", outline="", tags="roi"
             )
 
-        # polyline
         if len(pts) >= 2:
             flat = []
             for x, y in pts:
                 flat.extend([x, y])
             self.canvas.create_line(*flat, fill="lime", width=2, tags="roi")
 
-        # close polygon
         if self.roi_closed and len(pts) >= 3:
             self.canvas.create_line(
                 pts[-1][0], pts[-1][1],
@@ -280,7 +338,6 @@ class VideoPanel:
                 fill="lime", width=2, tags="roi"
             )
 
-        # hint text
         if self.editing_roi:
             self.canvas.create_text(
                 10, 10, anchor="nw",
@@ -288,7 +345,6 @@ class VideoPanel:
                 fill="white", tags="roi"
             )
 
-    # ---------- ROI Persistence (JSON) ----------
     def save_roi_temp(self):
         data = {}
         if os.path.exists(ROI_FILE):
@@ -308,8 +364,8 @@ class VideoPanel:
 
         print(f"[{self.name}] ROI saved to {ROI_FILE}")
         messagebox.showinfo(
-                "Area Saved",
-                f"Counted Area on the '{self.name.upper()}' has been saved successfully!"
+            "Area Saved",
+            f"Counted Area on the '{self.name.upper()}' has been saved successfully!"
         )
 
     def load_roi_temp(self):
@@ -328,12 +384,7 @@ class VideoPanel:
             self.roi_closed = bool(item.get("closed", False))
             print(f"[{self.name}] ROI loaded from {ROI_FILE}")
 
-    # ---------- OpenCV bridge ----------
     def get_roi_polygon_px(self, frame_bgr):
-        """
-        Returns Nx2 int32 polygon points in pixel space (OpenCV-friendly),
-        or None if ROI not valid.
-        """
         if not self.roi_closed or len(self.roi_points_norm) < 3:
             return None
 
@@ -344,56 +395,22 @@ class VideoPanel:
         )
         return pts
 
-    def get_roi_mask(self, frame_bgr):
-        """
-        Returns a uint8 mask (same w,h) with ROI filled, or None.
-        """
-        pts = self.get_roi_polygon_px(frame_bgr)
-        if pts is None:
-            return None
-        h, w = frame_bgr.shape[:2]
-        mask = np.zeros((h, w), dtype=np.uint8)
-        cv2.fillPoly(mask, [pts], 255)
-        return mask
-
-    def draw_traffic_overlay(self):
-        s = self.stats
-        y = 10
-
-        def line(text, color="white"):
-            nonlocal y
-            self.canvas.create_text(
-                10, y,
-                anchor="nw",
-                text=text,
-                fill=color,
-                font=("Segoe UI", 10, "bold"),
-                tags="overlay"
-            )
-            y += 18
-
-        self.canvas.delete("overlay")
-
-        line("SMART TRAFFIC LIGHT", "cyan")
-        line(f"Vehicles: {s.get('vehicles', 0)}", "yellow")
-        line(f"Green Time: {s.get('green_time', 0)} s", "lime")
-
-        fin = s.get("fuzzy_in", {})
-        fout = s.get("fuzzy_out", {})
-
-        if fin:
-            line(f"Fuzzy In  L:{fin['low']:.2f} M:{fin['medium']:.2f} H:{fin['high']:.2f}")
-
-        if fout:
-            line(f"Fuzzy Out S:{fout['short']:.2f} M:{fout['medium']:.2f} L:{fout['long']:.2f}")
 
 class TrafficApp:
     def __init__(self, root):
         self.root = root
         root.title("Smart Traffic Control System")
-        root.geometry("1400x800")
+        root.geometry("1600x900")
 
-        # ================= TOP TOOLBAR =================
+        # Initialize database and light controller
+        self.database = TrafficDatabase()
+        self.light_controller = TrafficLightController(PANELS)
+        
+        # AUTO START traffic lights immediately
+        self.light_controller.start()
+        print("🚦 Traffic lights AUTO-STARTED: NORTH is GREEN")
+
+        # Top toolbar
         toolbar = tk.Frame(root)
         toolbar.pack(fill=tk.X)
 
@@ -409,15 +426,28 @@ class TrafficApp:
             command=self.reload_all_roi
         ).pack(side=tk.LEFT, padx=5, pady=5)
 
-        # ================= MAIN LAYOUT =================
+        tk.Button(
+            toolbar,
+            text="View Stats",
+            command=self.show_stats_window,
+            bg="cyan"
+        ).pack(side=tk.LEFT, padx=5, pady=5)
+
+        tk.Button(
+            toolbar,
+            text="Export CSV",
+            command=self.export_data
+        ).pack(side=tk.LEFT, padx=5, pady=5)
+
+        # Main layout
         main = tk.Frame(root)
         main.pack(expand=True, fill=tk.BOTH)
 
-        main.columnconfigure(0, weight=4)  # video area
-        main.columnconfigure(1, weight=1)  # info panel
+        main.columnconfigure(0, weight=4)
+        main.columnconfigure(1, weight=1)
         main.rowconfigure(0, weight=1)
 
-        # ================= LEFT: VIDEO GRID =================
+        # Video grid
         video_grid = tk.Frame(main)
         video_grid.grid(row=0, column=0, sticky="nsew", padx=5, pady=5)
 
@@ -434,11 +464,11 @@ class TrafficApp:
         }
 
         for name, (r, c) in positions.items():
-            panel = VideoPanel(video_grid, name)
+            panel = VideoPanel(video_grid, name, self.light_controller, self.database)
             panel.frame.grid(row=r, column=c, sticky="nsew", padx=4, pady=4)
             self.panels[name] = panel
 
-        # ================= RIGHT: INFO PANEL =================
+        # Info panel
         self.info_panel = tk.LabelFrame(
             main,
             text="Traffic Information",
@@ -463,39 +493,40 @@ class TrafficApp:
             lbl.pack(fill="x", pady=5)
             self.info_labels[name] = lbl
 
-        # start periodic update
         self.update_info_panel()
 
-    # ================= INFO PANEL =================
     def _default_info_text(self, name):
         return (
             f"{name.upper()}\n"
             f"Vehicles: 0\n"
-            f"Green Light: 0 s"
+            f"Green Light: 0 s\n"
+            f"Status: WAITING"
         )
 
     def update_info_panel(self):
         for name, panel in self.panels.items():
             stats = getattr(panel, "stats", None)
+            light_state = self.light_controller.get_state(name)
 
             if not stats:
-                self.info_labels[name].config(
-                    text=self._default_info_text(name)
+                text = (
+                    f"{name.upper()}\n"
+                    f"Vehicles: 0\n"
+                    f"Green Light: 0 s\n"
+                    f"Light: {light_state['light']}"
                 )
-                continue
-
-            text = (
-                f"{name.upper()}\n"
-                f"Vehicles: {stats.get('count', 0)}\n"
-                f"Green Light: {stats.get('green', 0)} s"
-            )
+            else:
+                text = (
+                    f"{name.upper()}\n"
+                    f"Vehicles: {stats.get('count', 0)}\n"
+                    f"Green Light: {stats.get('green', 0)} s\n"
+                    f"Light: {light_state['light']}"
+                )
 
             self.info_labels[name].config(text=text)
 
-        # update every 500 ms
         self.root.after(500, self.update_info_panel)
 
-    # ================= ACTIONS =================
     def reload_all_roi(self):
         for p in self.panels.values():
             p.load_roi_temp()
@@ -511,6 +542,85 @@ class TrafficApp:
             for panel_name in PANELS:
                 if panel_name in base:
                     self.panels[panel_name].load_video(path)
+
+    def show_stats_window(self):
+        """Show statistics window"""
+        stats_win = tk.Toplevel(self.root)
+        stats_win.title("Traffic Statistics")
+        stats_win.geometry("800x600")
+
+        # Notebook (tabs)
+        notebook = ttk.Notebook(stats_win)
+        notebook.pack(expand=True, fill=tk.BOTH, padx=10, pady=10)
+
+        # Recent logs tab
+        logs_frame = ttk.Frame(notebook)
+        notebook.add(logs_frame, text="Recent Logs")
+
+        # Create treeview
+        tree = ttk.Treeview(
+            logs_frame,
+            columns=("Time", "Panel", "Vehicles", "Green", "Light"),
+            show="headings"
+        )
+
+        tree.heading("Time", text="Timestamp")
+        tree.heading("Panel", text="Panel")
+        tree.heading("Vehicles", text="Vehicles")
+        tree.heading("Green", text="Green Time")
+        tree.heading("Light", text="Light State")
+
+        tree.column("Time", width=150)
+        tree.column("Panel", width=100)
+        tree.column("Vehicles", width=100)
+        tree.column("Green", width=100)
+        tree.column("Light", width=100)
+
+        tree.pack(expand=True, fill=tk.BOTH)
+
+        # Load data
+        logs = self.database.get_recent_logs(100)
+        for log in logs:
+            tree.insert("", "end", values=log)
+
+        # Statistics tab
+        stats_frame = ttk.Frame(notebook)
+        notebook.add(stats_frame, text="Statistics")
+
+        stats_text = tk.Text(stats_frame, wrap=tk.WORD, font=("Courier", 10))
+        stats_text.pack(expand=True, fill=tk.BOTH, padx=10, pady=10)
+
+        # Get statistics for each panel
+        stats_text.insert(tk.END, "="*60 + "\n")
+        stats_text.insert(tk.END, "TRAFFIC STATISTICS\n")
+        stats_text.insert(tk.END, "="*60 + "\n\n")
+
+        for panel in PANELS:
+            stats = self.database.get_statistics(panel)
+            if stats:
+                total, avg, min_v, max_v, avg_green = stats
+                stats_text.insert(tk.END, f"{panel.upper()}\n")
+                stats_text.insert(tk.END, f"  Total Logs: {total}\n")
+                stats_text.insert(tk.END, f"  Avg Vehicles: {avg:.2f}\n")
+                stats_text.insert(tk.END, f"  Min Vehicles: {min_v}\n")
+                stats_text.insert(tk.END, f"  Max Vehicles: {max_v}\n")
+                stats_text.insert(tk.END, f"  Avg Green Time: {avg_green:.2f}s\n\n")
+
+        stats_text.config(state=tk.DISABLED)
+
+    def export_data(self):
+        """Export data to CSV"""
+        path = filedialog.asksaveasfilename(
+            defaultextension=".csv",
+            filetypes=[("CSV Files", "*.csv")]
+        )
+
+        if path:
+            if self.database.export_to_csv(path):
+                messagebox.showinfo(
+                    "Export Success",
+                    f"Data exported successfully to:\n{path}"
+                )
 
 
 if __name__ == "__main__":
